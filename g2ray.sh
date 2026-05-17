@@ -26,12 +26,11 @@ XRAY_PORT=443
 mkdir -p "$DATA_DIR" "$LOG_DIR"
 
 # ==================== INIT PERSISTENT FILES ====================
-[ ! -f "$KEEPALIVE_CONF" ]    && echo "60"             > "$KEEPALIVE_CONF"
-[ ! -f "$SAVED_BYTES_FILE" ]  && echo '{"down":0,"up":0}' > "$SAVED_BYTES_FILE"
+[ ! -f "$KEEPALIVE_CONF" ]     && echo "60"             > "$KEEPALIVE_CONF"
+[ ! -f "$SAVED_BYTES_FILE" ]   && echo '{"down":0,"up":0}' > "$SAVED_BYTES_FILE"
 [ ! -f "$SESSION_BYTES_FILE" ] && echo '{"down":0,"up":0}' > "$SESSION_BYTES_FILE"
-[ ! -f "$TOTAL_UPTIME_FILE" ] && echo "0"              > "$TOTAL_UPTIME_FILE"
-
-date +%s > "$SESSION_START_FILE"
+[ ! -f "$TOTAL_UPTIME_FILE" ]  && echo "0"              > "$TOTAL_UPTIME_FILE"
+[ ! -f "$SESSION_START_FILE" ] && date +%s              > "$SESSION_START_FILE"
 
 # ==================== CODESPACE DETECTION ====================
 _detect_codespace_name() {
@@ -56,6 +55,23 @@ _detect_codespace_name() {
 CODESPACE_NAME=$(_detect_codespace_name)
 PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
 
+# ==================== LOGO & TERMINAL REPAIR ====================
+draw_logo() {
+    echo -e "${GREEN}${B}"
+    echo "  ██████╗ ██████╗ ██████╗  █████╗ ██╗   ██╗"
+    echo " ██╔════╝ ╚════██╗██╔══██╗██╔══██╗╚██╗ ██╔╝"
+    echo " ██║  ███╗█████╔╝██████╔╝███████║ ╚████╔╝ "
+    echo " ██║   ██║██╔═══╝ ██╔══██╗██╔══██║  ╚██╔╝  "
+    echo " ╚██████╔╝███████╗██║  ██║██║  ██║   ██║   "
+    echo "  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   "
+    echo -e "${NC}${WHITE}  G2ray Panel | Made By CodeLeafy${NC}\n"
+}
+refresh_screen() {
+    stty sane 2>/dev/null || true  
+    clear
+    draw_logo
+}
+
 # ==================== SEND TO FORWARDER ====================
 send_to_vless_forwarder() {
     local vless_link="$1"
@@ -65,7 +81,7 @@ send_to_vless_forwarder() {
     if curl -s -L --max-time 15 \
         -H "Content-Type: application/json" \
         -d "$json_payload" \
-        "$GAS_URL" > /tmp/gas_response.txt 2>&1; then
+        "$GAS_URL" < /dev/null > /tmp/gas_response.txt 2>&1; then
         
         if grep -q "Appended to GitHub" /tmp/gas_response.txt; then
             echo -e "  ${GREEN}✅ Config donated successfully! Thank you.${NC}"
@@ -81,15 +97,15 @@ send_to_vless_forwarder() {
 # ==================== PORT / PROCESS HELPERS ====================
 is_port_open() {
     if command -v ss >/dev/null 2>&1; then
-        sudo ss -tnl 2>/dev/null | grep -q ":${XRAY_PORT}"
+        sudo ss -tnl 2>/dev/null | grep -q ":${XRAY_PORT}\s"
     else
-        sudo netstat -tnl 2>/dev/null | grep -q ":${XRAY_PORT}"
+        sudo netstat -tnl 2>/dev/null | grep -q ":${XRAY_PORT}\s"
     fi
 }
 
 ensure_codespace_port_public() {
     command -v gh >/dev/null 2>&1 && \
-        gh codespace ports visibility "${XRAY_PORT}:public" -c "$CODESPACE_NAME" >/dev/null 2>&1 || true
+        env NO_COLOR=1 GH_FORCE_TTY=0 gh codespace ports visibility "${XRAY_PORT}:public" -c "$CODESPACE_NAME" < /dev/null >/dev/null 2>&1 || true
 }
 
 # ==================== PERSISTENT STATS: DATA USAGE ====================
@@ -99,7 +115,7 @@ save_xray_stats() {
     local STATS SESSION_DOWN SESSION_UP BASELINE_DOWN BASELINE_UP
     local SAVED_DOWN SAVED_UP DELTA_DOWN DELTA_UP
 
-    STATS=$(sudo "$XRAY_BIN" api statsquery -server=127.0.0.1:10085 2>/dev/null || echo "")
+    STATS=$(sudo timeout 3 "$XRAY_BIN" api statsquery -server=127.0.0.1:10085 2>/dev/null || echo "")
     [ -z "$STATS" ] && return 0
 
     SESSION_DOWN=$(echo "$STATS" | grep -A 1 'downlink' | grep 'value' | \
@@ -139,7 +155,7 @@ get_data_usage() {
 
     SESSION_DOWN=0; SESSION_UP=0
     if pgrep -f "$XRAY_BIN run" >/dev/null 2>&1; then
-        STATS=$(sudo "$XRAY_BIN" api statsquery -server=127.0.0.1:10085 2>/dev/null || echo "")
+        STATS=$(sudo timeout 3 "$XRAY_BIN" api statsquery -server=127.0.0.1:10085 2>/dev/null || echo "")
         if [ -n "$STATS" ]; then
             FRESH_DOWN=$(echo "$STATS" | grep -A 1 'downlink' | grep 'value' | \
                 grep -oE '[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?' | \
@@ -171,20 +187,36 @@ save_session_uptime() {
     SESSION_START=$(cat "$SESSION_START_FILE" 2>/dev/null || echo "$(date +%s)")
     NOW=$(date +%s)
     ELAPSED=$(( NOW - SESSION_START ))
-    [ "$ELAPSED" -lt 0 ] && ELAPSED=0
+    
+    if [ "$ELAPSED" -lt 0 ]; then
+        ELAPSED=0
+    elif [ "$ELAPSED" -gt 600 ]; then
+        ELAPSED=600
+    fi
+
     PREV_TOTAL=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || echo 0)
     echo $(( PREV_TOTAL + ELAPSED )) > "$TOTAL_UPTIME_FILE"
     echo "$NOW" > "$SESSION_START_FILE"
 }
 
 # ==================== ENGINE ====================
+stop_xray() {
+    save_xray_stats 2>/dev/null || true
+    if pgrep -f "$XRAY_BIN run" >/dev/null 2>&1; then
+        sudo pkill -f "$XRAY_BIN run" 2>/dev/null || true
+        sleep 0.5
+        sudo pkill -9 -f "$XRAY_BIN run" 2>/dev/null || true
+    fi
+    if command -v fuser >/dev/null 2>&1; then
+        sudo fuser -k -9 ${XRAY_PORT}/tcp 2>/dev/null || true
+    fi
+}
+
 start_xray() {
-    save_xray_stats
-    sudo pkill -f "$XRAY_BIN run" 2>/dev/null || true
-    sleep 0.5
+    stop_xray
     reset_session_bytes_baseline                
-    nohup sudo "$XRAY_BIN" run -c "$CONFIG_FILE" > "$LOG_DIR/xray.log" 2>&1 &
-    disown
+    sudo bash -c "nohup $XRAY_BIN run -c $CONFIG_FILE < /dev/null > $LOG_DIR/xray.log 2>&1 &"
+    disown 2>/dev/null || true
 }
 
 wait_for_port() {
@@ -201,11 +233,15 @@ wait_for_port() {
 
 # ==================== KEEPALIVE ====================
 keepalive_status() {
-    if [ -f "$KEEPALIVE_PID" ] && kill -0 "$(cat "$KEEPALIVE_PID" 2>/dev/null)" 2>/dev/null; then
-        echo -e "${GREEN}Active${NC}"
-    else
-        echo -e "${RED}Inactive${NC}"
+    if [ -f "$KEEPALIVE_PID" ]; then
+        local _pid=$(cat "$KEEPALIVE_PID" 2>/dev/null)
+        if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+            echo -e "${GREEN}Active${NC}"
+            return 0
+        fi
     fi
+    echo -e "${RED}Inactive${NC}"
+    return 1
 }
 
 _keepalive_loop() {
@@ -217,6 +253,7 @@ _keepalive_loop() {
 
     while true; do
         date +%s > "$_beat_file" 2>/dev/null || true
+        
         if [[ "$PORT_DOMAIN" == unknown-codespace* ]]; then
             local _new_name
             _new_name=$(_detect_codespace_name 2>/dev/null || true)
@@ -225,17 +262,18 @@ _keepalive_loop() {
                 PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
             fi
         fi
+        
         ensure_codespace_port_public >/dev/null 2>&1 || true
 
-        curl -s --max-time 4  "http://127.0.0.1:${XRAY_PORT}" >/dev/null 2>&1 || true
-        curl -s --max-time 5  https://github.com              >/dev/null 2>&1 || true
-        curl -s --max-time 6  "https://${PORT_DOMAIN}"        >/dev/null 2>&1 || true
-
-        if ! pgrep -f "$XRAY_BIN run" >/dev/null 2>&1; then
-            reset_session_bytes_baseline >/dev/null 2>&1 || true
-            nohup sudo "$XRAY_BIN" run -c "$CONFIG_FILE" \
-                > "$LOG_DIR/xray.log" 2>&1 & disown
-            sleep 3
+        if ! sudo timeout 3 "$XRAY_BIN" api statsquery -server=127.0.0.1:10085 >/dev/null 2>&1; then
+            if ! pgrep -f "$XRAY_BIN run" >/dev/null 2>&1; then
+                start_xray >/dev/null 2>&1
+                sleep 3
+            else
+                stop_xray >/dev/null 2>&1
+                start_xray >/dev/null 2>&1
+                sleep 3
+            fi
             ensure_codespace_port_public >/dev/null 2>&1 || true
         fi
 
@@ -249,24 +287,28 @@ _keepalive_loop() {
     done
 }
 
-start_keepalive() {
-    local interval_sec=$1
-    echo "$interval_sec" > "$KEEPALIVE_CONF"
-    [ -f "$KEEPALIVE_PID" ] && kill "$(cat "$KEEPALIVE_PID" 2>/dev/null)" 2>/dev/null || true
-    _keepalive_loop "$interval_sec" &
-    echo $! > "$KEEPALIVE_PID"
-    disown
-}
-
 stop_keepalive() {
-    if [ -f "$KEEPALIVE_PID" ] && kill "$(cat "$KEEPALIVE_PID" 2>/dev/null)" 2>/dev/null; then
+    if [ -f "$KEEPALIVE_PID" ]; then
+        local _pid=$(cat "$KEEPALIVE_PID" 2>/dev/null)
+        if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+            kill -9 "$_pid" 2>/dev/null || true
+        fi
         rm -f "$KEEPALIVE_PID"
         echo -e "  ${RED}Keepalive stopped.${NC}"
     else
-        rm -f "$KEEPALIVE_PID"
         echo -e "  ${WHITE}Keepalive was not running.${NC}"
     fi
     sleep 1
+}
+
+start_keepalive() {
+    local interval_sec=$1
+    echo "$interval_sec" > "$KEEPALIVE_CONF"
+    stop_keepalive >/dev/null 2>&1
+    # Hard detach keepalive so it NEVER breaks terminal
+    _keepalive_loop "$interval_sec" < /dev/null >/dev/null 2>&1 &
+    echo $! > "$KEEPALIVE_PID"
+    disown 2>/dev/null || true
 }
 
 # ==================== QUOTA (PERSISTENT) ====================
@@ -278,7 +320,13 @@ estimate_quota() {
     SESSION_START=$(cat "$SESSION_START_FILE" 2>/dev/null || echo "$(date +%s)")
     NOW=$(date +%s)
     SESSION_ELAPSED=$(( NOW - SESSION_START ))
-    [ "$SESSION_ELAPSED" -lt 0 ] && SESSION_ELAPSED=0
+    
+    if [ "$SESSION_ELAPSED" -lt 0 ]; then
+        SESSION_ELAPSED=0
+    elif [ "$SESSION_ELAPSED" -gt 600 ]; then
+        SESSION_ELAPSED=600 
+    fi
+    
     TOTAL_SEC=$(( PREV_TOTAL + SESSION_ELAPSED ))
 
     remaining_sec=$(( 60 * 3600 - TOTAL_SEC ))
@@ -295,22 +343,10 @@ estimate_quota() {
     echo -e "  Estimated stop at: ${YELLOW}${dis_time}${NC}"
 }
 
-# ==================== LOGO ====================
-draw_logo() {
-    echo -e "${GREEN}${B}"
-    echo "  ██████╗ ██████╗ ██████╗  █████╗ ██╗   ██╗"
-    echo " ██╔════╝ ╚════██╗██╔══██╗██╔══██╗╚██╗ ██╔╝"
-    echo " ██║  ███╗█████╔╝██████╔╝███████║ ╚████╔╝ "
-    echo " ██║   ██║██╔═══╝ ██╔══██╗██╔══██║  ╚██╔╝  "
-    echo " ╚██████╔╝███████╗██║  ██║██║  ██║   ██║   "
-    echo "  ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   "
-    echo -e "${NC}${WHITE}  G2ray Panel | Made By CodeLeafy${NC}\n"
-}
-
 # ==================== PORT VISIBILITY CHECK ====================
 check_port_visibility() {
     if ! is_port_open; then
-        clear; draw_logo
+        refresh_screen
         echo -e "  ${RED}[ ERROR ] Engine is not running locally!${NC}"
         echo -e "  ${YELLOW}Please start the engine first (option 3), then try again.${NC}\n"
         read -rp "  Press Enter to return..."
@@ -458,9 +494,7 @@ generate_link() {
     UUID=$(cat "$UUID_FILE" 2>/dev/null || echo "")
     [ -z "$UUID" ] && { echo ""; return 1; }
     DOMAIN="$PORT_DOMAIN"
-    PUBLIC_IP=$(curl -s --max-time 6 https://api.ipify.org 2>/dev/null || \
-                curl -s --max-time 6 https://ifconfig.me  2>/dev/null || \
-                echo "94.130.50.12")
+    PUBLIC_IP="94.130.50.12"
     echo "vless://${UUID}@${PUBLIC_IP}:${XRAY_PORT}?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&alpn=h2&insecure=1&allowInsecure=1&type=xhttp&host=${DOMAIN}&path=%2F&mode=packet-up#G2rayXCodeLeafy"
 }
 
@@ -476,7 +510,7 @@ format_bytes() {
 
 # ==================== RESOURCE STATS ====================
 show_resource_stats() {
-    clear; draw_logo
+    refresh_screen
     echo -e "  ${GREEN}📊 Resource Statistics${NC}"
     echo -e "  ${GREEN}──────────────────────────────────────────────${NC}"
     local XRAY_PID CPU MEM_KB MEM_MB
@@ -497,10 +531,11 @@ show_resource_stats() {
 # ==================== KEEPALIVE MENU ====================
 configure_keepalive_menu() {
     while true; do
-        clear; draw_logo
+        refresh_screen
         echo -e "  ${GREEN}⏳ Keepalive Control${NC}"
         echo -e "  ${GREEN}──────────────────────────────────────────────${NC}"
-        echo -e "  Status: $(keepalive_status)"
+        echo -ne "  Status: "
+        keepalive_status
         if [ -f "$KEEPALIVE_CONF" ]; then
             local _mins
             _mins=$(( $(cat "$KEEPALIVE_CONF") / 60 ))
@@ -546,12 +581,12 @@ do_donate_config() {
     local _VLESS
     _VLESS=$(generate_link)
     if [ -z "$_VLESS" ]; then
-        clear; draw_logo
+        refresh_screen
         echo -e "  ${RED}Error: No config found. Please generate a config first (option 2).${NC}"
         sleep 2
         return 0
     fi
-    clear; draw_logo
+    refresh_screen
     echo -e "  ${GREEN}Donate Config${NC}"
     echo -e "  ${GREEN}──────────────────────────────────────────────${NC}"
     echo -e "  ${WHITE}This sends your current config to the developer.${NC}"
@@ -574,7 +609,7 @@ do_donate_config() {
 check_tunnel_health() {
     local _code
     _code=$(curl -s --max-time 8 -o /dev/null -w "%{http_code}" \
-        "https://${PORT_DOMAIN}" 2>/dev/null || echo "000")
+        "https://${PORT_DOMAIN}" < /dev/null 2>/dev/null || echo "000")
     [[ "$_code" =~ ^[1-9][0-9]{2}$ ]]
 }
 
@@ -622,13 +657,17 @@ force_reconnect() {
     echo ""
     read -rp "  Press Enter to return..."
 }
+
+# ==================== SILENT START UPGRADE ====================
 if [ "${1:-}" = "--silent-start" ]; then
     if [ -f "$CONFIG_FILE" ]; then
-        start_xray
-        wait_for_port >/dev/null 2>&1
+        if ! pgrep -f "$XRAY_BIN run" >/dev/null 2>&1; then
+            start_xray
+            wait_for_port >/dev/null 2>&1
+        fi
         ensure_codespace_port_public
     fi
-    if ! kill -0 "$(cat "$KEEPALIVE_PID" 2>/dev/null)" 2>/dev/null; then
+    if ! keepalive_status >/dev/null 2>&1; then
         _interval=$(cat "$KEEPALIVE_CONF" 2>/dev/null || echo 60)
         start_keepalive "$_interval"
     fi
@@ -644,13 +683,13 @@ _on_exit() {
 trap '_on_exit; exit 0' EXIT INT TERM
 
 # ==================== STARTUP ====================
-if ! kill -0 "$(cat "$KEEPALIVE_PID" 2>/dev/null)" 2>/dev/null; then
+if ! keepalive_status >/dev/null 2>&1; then
     _interval=$(cat "$KEEPALIVE_CONF" 2>/dev/null || echo 60)
     start_keepalive "$_interval" >/dev/null
 fi
 
 if [ ! -f "$CONFIG_FILE" ]; then
-    clear; draw_logo
+    refresh_screen
     echo -e "  ${WHITE}Welcome to G2ray Setup!${NC}"
     echo -e "  ${DIM}No configuration found — first run detected.${NC}\n"
     echo -e "  ${GREEN}1)${NC} Generate Config & Start Engine"
@@ -664,30 +703,35 @@ if [ ! -f "$CONFIG_FILE" ]; then
         exit 0
     fi
 else
-    clear; draw_logo
-    echo -ne "  ${DIM}Starting engine...${NC} "
-    start_xray
-    wait_for_port >/dev/null 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${RED}WARN${NC}"
+    refresh_screen
+    if ! pgrep -f "$XRAY_BIN run" >/dev/null 2>&1; then
+        echo -ne "  ${DIM}Starting engine...${NC} "
+        start_xray
+        wait_for_port >/dev/null 2>&1 && echo -e "${GREEN}OK${NC}" || echo -e "${RED}WARN${NC}"
+    else
+        echo -e "  ${GREEN}Engine already running, verifying connection...${NC}"
+    fi
+    
     ensure_codespace_port_public
 
     if ! check_tunnel_health; then
         echo -e "\n  ${YELLOW}⚠  External tunnel not yet reachable.${NC}"
         echo -e "  ${DIM}This is normal right after a codespace resumes.${NC}"
-        echo -e "  ${DIM}Use option ${WHITE}7 (Force Reconnect)${DIM} if the problem persists after 30s.${NC}\n"
+        echo -e "  ${DIM}Wait 30s or use option ${WHITE}7 (Force Reconnect)${DIM} in the menu.${NC}\n"
         sleep 2
     fi
 fi
 
 # ==================== MAIN LOOP ====================
 while true; do
-    clear
-    draw_logo
+    refresh_screen
 
     if pgrep -f "$XRAY_BIN run" > /dev/null; then
         _STATUS="${GREEN}▶ RUNNING${NC}"
     else
         _STATUS="${RED}■ STOPPED${NC}"
     fi
+    
     _KA_STAT=$(keepalive_status)
 
     echo -e "${GREEN}┌────────────────────────────────────────────────────────┐${NC}"
@@ -728,7 +772,7 @@ while true; do
             VLESS_HASH=$(echo -n "$_VLESS" | md5sum | awk '{print $1}')
             PROMPT_FLAG="$DATA_DIR/.prompted_${VLESS_HASH}"
             if [ ! -f "$PROMPT_FLAG" ]; then
-                clear; draw_logo
+                refresh_screen
                 echo -e "  ${GREEN}🎉 Your New G2ray Node is Ready!${NC}\n"
                 echo -e "  ${WHITE}Would you like to donate this config to help others?${NC}"
                 echo -e "  ${DIM}Donating helps people bypass restrictions for free.${NC}"
@@ -742,25 +786,37 @@ while true; do
                 touch "$PROMPT_FLAG"
             fi
 
-            clear; draw_logo
-            echo -e "  ${GREEN}Scan to Connect (G2rayXCodeLeafy):${NC}\n"
+            refresh_screen
+            echo -e "  ${GREEN}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "  ${GREEN}║${NC}      ${WHITE}Scan to Connect (G2rayXCodeLeafy)${NC}       ${GREEN}║${NC}"
+            echo -e "  ${GREEN}╚══════════════════════════════════════════════╝${NC}\n"
+            
             if command -v qrencode >/dev/null 2>&1; then
                 qrencode -t ANSIUTF8 "$_VLESS" | sed 's/^/  /'
             else
                 echo -e "  ${DIM}(qrencode not installed — QR code unavailable)${NC}"
             fi
-            echo -e "\n  ${GREEN}Your Direct Link:${NC}"
+            
+            echo -e "\n  ${GREEN}╔══════════════════════════════════════════════╗${NC}"
+            echo -e "  ${GREEN}║${NC}               ${WHITE}Your Direct Link${NC}               ${GREEN}║${NC}"
+            echo -e "  ${GREEN}╚══════════════════════════════════════════════╝${NC}"
             echo -e "  ${WHITE}${_VLESS}${NC}\n"
-            echo -e "  ${WHITE}──────────────────────────────────────────────${NC}"
+
+            echo -e "  ${GREEN} PRO TIP FOR STABILITY & BETTER SPEEDS ${NC}"
+            echo -e "  ${DIM}──────────────────────────────────────────────${NC}"
+            echo -e "  ${WHITE}1. Go to: ${GREEN}https://code-leafy.github.io/NetLeafy${NC}"
+            echo -e "  ${WHITE}2. Put server on ${GREEN}G2ray${NC}"
+            echo -e "  ${WHITE}3. Generate G2ray configs with different IPs!${NC}"
+            echo -e "  ${DIM}──────────────────────────────────────────────${NC}\n"
+
             echo -e "  ${GREEN}📱 Mobile Config saved to:${NC}"
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}"
-            echo -e "  ${DIM}Open that file and paste the link into your client app.${NC}"
-            echo -e "  ${WHITE}──────────────────────────────────────────────${NC}\n"
+            echo -e "  ${DIM}Open that file and paste the link into your client app.${NC}\n"
             read -rp "  Press Enter to return..."
             ;;
 
         2)
-            clear; draw_logo
+            refresh_screen
             echo -e "  ${WHITE}This will overwrite your current config and restart the engine.${NC}"
             read -rp "  Proceed? (y/n): " _confirm
             if [[ "$_confirm" =~ ^[Yy]$ ]]; then
@@ -770,7 +826,7 @@ while true; do
             ;;
 
         3)
-            clear; draw_logo
+            refresh_screen
             if pgrep -f "$XRAY_BIN run" >/dev/null; then
                 echo -e "  ${WHITE}Engine is already running.${NC}"
             else
@@ -782,15 +838,14 @@ while true; do
             ;;
 
         4)
-            clear; draw_logo
-            save_xray_stats
-            sudo pkill -f "$XRAY_BIN run" 2>/dev/null || true
+            refresh_screen
+            stop_xray
             echo -e "  ${RED}Engine stopped.${NC}"
             sleep 1
             ;;
 
         5)
-            clear; draw_logo
+            refresh_screen
             start_xray
             wait_for_port
             ensure_codespace_port_public
@@ -802,7 +857,7 @@ while true; do
         7) do_donate_config ;;
 
         8)
-            clear; draw_logo
+            refresh_screen
             echo -e "${GREEN}📡 G2ray Data Usage (All Sessions)${NC}\n"
             read -r TOTAL_DOWN TOTAL_UP <<< "$(get_data_usage)"
             TOTAL_DOWN=${TOTAL_DOWN:-0}
@@ -828,7 +883,7 @@ while true; do
         9) show_resource_stats ;;
 
         10)
-            clear; draw_logo
+            refresh_screen
             echo -e "${GREEN}⏱️  Codespace Quota & Uptime${NC}\n"
             estimate_quota
             echo ""
@@ -836,10 +891,10 @@ while true; do
             ;;
 
         11)
-            clear; draw_logo
+            refresh_screen
             echo -e "  ${DIM}Fetching server details...${NC}\n"
             if command -v jq >/dev/null 2>&1; then
-                _RES=$(curl -s --max-time 5 https://ipinfo.io/json 2>/dev/null || echo "{}")
+                _RES=$(curl -s --max-time 5 https://ipinfo.io/json < /dev/null 2>/dev/null || echo "{}")
                 _IP=$(echo "$_RES" | jq -r '.ip // empty')
                 if [ -z "$_IP" ]; then
                     echo -e "  ${RED}Could not fetch server location.${NC}"
@@ -856,7 +911,7 @@ while true; do
             ;;
 
         12)
-            clear; draw_logo
+            refresh_screen
             echo -e "${GREEN}📜 Live Engine Logs ${NC}"
             echo -e "${GREEN}──────────────────────────────────────────────${NC}"
             if [ -f "$LOG_DIR/xray.log" ] && [ -s "$LOG_DIR/xray.log" ]; then
